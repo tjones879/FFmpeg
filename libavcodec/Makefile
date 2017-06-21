@@ -611,7 +611,7 @@ OBJS-$(CONFIG_VMNC_DECODER)            += vmnc.o
 OBJS-$(CONFIG_VORBIS_DECODER)          += vorbisdec.o vorbisdsp.o vorbis.o \
                                           vorbis_data.o
 OBJS-$(CONFIG_VORBIS_ENCODER)          += vorbisenc.o vorbis.o \
-                                          vorbis_data.o
+                                          vorbis_data.o vorbispsy.o
 OBJS-$(CONFIG_VP3_DECODER)             += vp3.o
 OBJS-$(CONFIG_VP5_DECODER)             += vp5.o vp56.o vp56data.o vp56rac.o
 OBJS-$(CONFIG_VP6_DECODER)             += vp6.o vp56.o vp56data.o \
