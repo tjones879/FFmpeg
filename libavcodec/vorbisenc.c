@@ -33,6 +33,7 @@
 #include "mathops.h"
 #include "vorbis.h"
 #include "vorbis_enc_data.h"
+#include "vorbispsy.h"
 
 #include "audio_frame_queue.h"
 #include "libavfilter/bufferqueue.h"
@@ -136,6 +137,7 @@ typedef struct vorbis_enc_context {
     int64_t next_pts;
 
     AVFloatDSPContext *fdsp;
+    VorbisPsyContext *vpctx;
 } vorbis_enc_context;
 
 #define MAX_CHANNELS     2
@@ -272,11 +274,12 @@ static int create_vorbis_context(vorbis_enc_context *venc,
     vorbis_enc_floor   *fc;
     vorbis_enc_residue *rc;
     vorbis_enc_mapping *mc;
-    int i, book, ret;
+    int i, book, ret, blocks;
 
     venc->channels    = avctx->channels;
     venc->sample_rate = avctx->sample_rate;
-    venc->log2_blocksize[0] = venc->log2_blocksize[1] = 11;
+    venc->log2_blocksize[0] = 8;
+    venc->log2_blocksize[1] = 11;
 
     venc->ncodebooks = FF_ARRAY_ELEMS(cvectors);
     venc->codebooks  = av_malloc(sizeof(vorbis_enc_codebook) * venc->ncodebooks);
@@ -463,6 +466,12 @@ static int create_vorbis_context(vorbis_enc_context *venc,
 
     if ((ret = dsp_init(avctx, venc)) < 0)
         return ret;
+
+    blocks = 1 << (venc->log2_blocksize[1] - venc->log2_blocksize[0]);
+    venc->vpctx = av_mallocz(sizeof(VorbisPsyContext));
+    if (!venc->vpctx || (ret = ff_psy_vorbis_init(venc->vpctx, venc->sample_rate,
+                                                  venc->channels, blocks)) < 0)
+        return AVERROR(ENOMEM);
 
     return 0;
 }
@@ -1071,22 +1080,23 @@ static void move_audio(vorbis_enc_context *venc, int sf_size)
             float *save = venc->saved + ch * frame_size;
             const float *input = (float *) cur->extended_data[ch];
             const size_t len  = cur->nb_samples * sizeof(float);
-
             memcpy(offset + sf*sf_size, input, len);
             memcpy(save + sf*sf_size, input, len);   // Move samples for next frame
         }
         av_frame_free(&cur);
     }
     venc->have_saved = 1;
-    memcpy(venc->scratch, venc->samples, 2 * venc->channels * frame_size);
+    memcpy(venc->scratch, venc->samples, sizeof(float) * venc->channels * 2 * frame_size);
 }
 
 static int vorbis_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
                                const AVFrame *frame, int *got_packet_ptr)
 {
     vorbis_enc_context *venc = avctx->priv_data;
-    int i, ret, need_more;
+    int i, ret, need_more, ch;
+    int curr_win = 1;
     int frame_size = 1 << (venc->log2_blocksize[1] - 1);
+    int block_size = 1 << (venc->log2_blocksize[0] - 1);
     vorbis_enc_mode *mode;
     vorbis_enc_mapping *mapping;
     PutBitContext pb;
@@ -1120,6 +1130,13 @@ static int vorbis_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     }
 
     move_audio(venc, avctx->frame_size);
+
+    for (ch = 0; ch < venc->channels; ch++) {
+        float *scratch = venc->scratch + 2 * ch * frame_size + frame_size;
+
+        if (!ff_psy_vorbis_block_frame(venc->vpctx, scratch, ch, frame_size, block_size))
+            curr_win = 0;
+    }
 
     if (!apply_window_and_mdct(venc))
         return 0;
@@ -1252,6 +1269,7 @@ static av_cold int vorbis_encode_close(AVCodecContext *avctx)
     ff_mdct_end(&venc->mdct[1]);
     ff_af_queue_close(&venc->afq);
     ff_bufqueue_discard_all(&venc->bufqueue);
+    ff_psy_vorbis_close(venc->vpctx);
 
     av_freep(&avctx->extradata);
 
