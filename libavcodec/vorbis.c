@@ -59,7 +59,7 @@ int ff_vorbis_len2vlc(uint8_t *bits, uint32_t *codes, unsigned num)
     unsigned i, j, p, code;
 
     for (p = 0; (bits[p] == 0) && (p < num); ++p)
-        ;
+        codes[p] = 0;
     if (p == num)
         return 0;
 
@@ -78,9 +78,11 @@ int ff_vorbis_len2vlc(uint8_t *bits, uint32_t *codes, unsigned num)
 
     for (; p < num; ++p) {
         if (bits[p] > 32)
-             return AVERROR_INVALIDDATA;
-        if (bits[p] == 0)
-             continue;
+            return AVERROR_INVALIDDATA;
+        if (bits[p] == 0) {
+            codes[p] = 0;
+            continue;
+        }
         // find corresponding exit(node which the tree can grow further from)
         for (i = bits[p]; i > 0; --i)
             if (exit_at_level[i])

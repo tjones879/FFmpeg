@@ -2,7 +2,7 @@ FATE_VORBIS += fate-vorbis-encode
 fate-vorbis-encode: CMD = enc_dec_pcm ogg wav s16le $(TARGET_SAMPLES)/audio-reference/luckynight_2ch_44kHz_s16.wav -c:a vorbis -strict experimental
 fate-vorbis-encode: REF = $(SAMPLES)/audio-reference/luckynight_2ch_44kHz_s16.wav
 fate-vorbis-encode: CMP_SHIFT = 0
-fate-vorbis-encode: CMP_TARGET = 296
+fate-vorbis-encode: CMP_TARGET = 650
 fate-vorbis-encode: SIZE_TOLERANCE = 3560
 fate-vorbis-encode: FUZZ = 30
 
