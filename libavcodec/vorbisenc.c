@@ -106,6 +106,9 @@ typedef struct vorbis_enc_context {
     int channels;
     int sample_rate;
     int log2_blocksize[2];
+    int blockflags[3]; ///< Flags used for the previous, current, next windows
+    int transient;     ///< Negative if a series of transients are not being encoded
+    int num_transient; ///< Number of short blocks for each frame
     FFTContext mdct[2];
     const float *win[2];
     int have_saved;
@@ -113,7 +116,7 @@ typedef struct vorbis_enc_context {
     float *samples;
     float *floor;  // also used for tmp values for mdct
     float *coeffs; // also used for residue after floor
-    float *scratch; // used for tmp values for psy model
+    float *scratch; //< Used for temp values for psy model and window application
     float quality;
 
     AudioFrameQueue afq;
@@ -268,27 +271,134 @@ static av_cold int dsp_init(AVCodecContext *avctx, vorbis_enc_context *venc)
     return 0;
 }
 
+static int create_residues(vorbis_enc_context *venc)
+{
+    int res, ret;
+    vorbis_enc_residue *rc;
+
+    venc->nresidues = 2;
+    venc->residues  = av_malloc(sizeof(vorbis_enc_residue) * venc->nresidues);
+    if (!venc->residues)
+        return AVERROR(ENOMEM);
+
+    for (res = 0; res < venc->nresidues; res++) {
+        rc = &venc->residues[res];
+        rc->type            = 2;
+        rc->begin           = 0;
+        rc->end             = res ? 1600 : 208;
+        rc->partition_size  = res ?   32 :  16;
+        rc->classbook       = res ?   24 :  23;
+        rc->classifications = 10;
+        rc->books           = av_malloc(sizeof(*rc->books) * rc->classifications);
+        if (!rc->books)
+            return AVERROR(ENOMEM);
+        {
+            static const int8_t a[10][8] = {
+                { -1, -1, -1, -1, -1, -1, -1, -1, },
+                { -1, -1, 25, -1, -1, -1, -1, -1, },
+                { -1, -1, 26, -1, -1, -1, -1, -1, },
+                { -1, -1, 27, -1, -1, -1, -1, -1, },
+                { -1, -1, 28, -1, -1, -1, -1, -1, },
+                { -1, -1, 29, -1, -1, -1, -1, -1, },
+                { -1, -1, 30, -1, -1, -1, -1, -1, },
+                { 31, 32, -1, -1, -1, -1, -1, -1, },
+                { 33, 34, -1, -1, -1, -1, -1, -1, },
+                { 35, 36, 37, -1, -1, -1, -1, -1, },
+            };
+            memcpy(rc->books, a, sizeof a);
+        }
+        if ((ret = ready_residue(rc, venc)) < 0)
+            return ret;
+    }
+    return 0;
+}
+
+static int create_floors(vorbis_enc_context *venc, AVCodecContext *avctx)
+{
+    int i, floor;
+    vorbis_enc_floor   *fc;
+
+    venc->nfloors = 2;
+    venc->floors  = av_malloc(sizeof(vorbis_enc_floor) * venc->nfloors);
+    if (!venc->floors)
+        return AVERROR(ENOMEM);
+
+    for (floor = 0; floor < venc->nfloors; floor++) {
+        fc = &venc->floors[floor];
+        fc->partitions         = floor ? 8 : 2;
+        fc->partition_to_class = av_malloc(sizeof(int) * fc->partitions);
+        if (!fc->partition_to_class)
+            return AVERROR(ENOMEM);
+        fc->nclasses           = 0;
+        for (i = 0; i < fc->partitions; i++) {
+            static const int a[] = {0, 1, 2, 2, 3, 3, 4, 4};
+            fc->partition_to_class[i] = a[i];
+            fc->nclasses = FFMAX(fc->nclasses, fc->partition_to_class[i]);
+        }
+        fc->nclasses++;
+        fc->classes = av_malloc_array(fc->nclasses, sizeof(vorbis_enc_floor_class));
+        if (!fc->classes)
+            return AVERROR(ENOMEM);
+        for (i = 0; i < fc->nclasses; i++) {
+            vorbis_enc_floor_class * c = &fc->classes[i];
+            int j, books;
+            c->dim        = floor_classes[floor][i].dim;
+            c->subclass   = floor_classes[floor][i].subclass;
+            c->masterbook = floor_classes[floor][i].masterbook;
+            books         = (1 << c->subclass);
+            c->books      = av_malloc_array(books, sizeof(int));
+            if (!c->books)
+                return AVERROR(ENOMEM);
+            for (j = 0; j < books; j++)
+                c->books[j] = floor_classes[floor][i].nbooks[j];
+        }
+        fc->multiplier = 2;
+        fc->rangebits  = venc->log2_blocksize[floor] - 1;
+
+        fc->values = 2;
+        for (i = 0; i < fc->partitions; i++)
+            fc->values += fc->classes[fc->partition_to_class[i]].dim;
+
+        fc->list = av_malloc_array(fc->values, sizeof(vorbis_floor1_entry));
+        if (!fc->list)
+            return AVERROR(ENOMEM);
+        fc->list[0].x = 0;
+        fc->list[1].x = 1 << fc->rangebits;
+        for (i = 2; i < fc->values; i++) {
+            static const int a[2][27] = {
+                { 14,  4, 58,  2,  8, 28, 90},
+                { 93, 23,372,  6, 46,186,750, 14, 33, 65,
+                 130,260,556,  3, 10, 18, 28, 39, 55, 79,
+                 111,158,220,312,464,650,850}
+            };
+            fc->list[i].x = a[floor][i - 2];
+        }
+        if (ff_vorbis_ready_floor1_list(avctx, fc->list, fc->values))
+            return AVERROR_BUG;
+    }
+
+    return 0;
+}
+
 static int create_vorbis_context(vorbis_enc_context *venc,
                                  AVCodecContext *avctx)
 {
-    vorbis_enc_floor   *fc;
-    vorbis_enc_residue *rc;
     vorbis_enc_mapping *mc;
-    int i, book, ret, blocks;
+    int i, map, book, ret, blocks;
 
     venc->channels    = avctx->channels;
     venc->sample_rate = avctx->sample_rate;
     venc->log2_blocksize[0] = 8;
     venc->log2_blocksize[1] = 11;
+    venc->blockflags[0] = venc->blockflags[1] = venc->blockflags[2] = 1;
+    venc->transient = -1;
+    venc->num_transient = 1 << (venc->log2_blocksize[1] - venc->log2_blocksize[0]);
 
     venc->ncodebooks = FF_ARRAY_ELEMS(cvectors);
     venc->codebooks  = av_malloc(sizeof(vorbis_enc_codebook) * venc->ncodebooks);
     if (!venc->codebooks)
         return AVERROR(ENOMEM);
 
-    // codebook 0..14 - floor1 book, values 0..255
-    // codebook 15 residue masterbook
-    // codebook 16..29 residue
     for (book = 0; book < venc->ncodebooks; book++) {
         vorbis_enc_codebook *cb = &venc->codebooks[book];
         int vals;
@@ -320,126 +430,42 @@ static int create_vorbis_context(vorbis_enc_context *venc,
             return ret;
     }
 
-    venc->nfloors = 1;
-    venc->floors  = av_malloc(sizeof(vorbis_enc_floor) * venc->nfloors);
-    if (!venc->floors)
-        return AVERROR(ENOMEM);
-
-    // just 1 floor
-    fc = &venc->floors[0];
-    fc->partitions         = NUM_FLOOR_PARTITIONS;
-    fc->partition_to_class = av_malloc(sizeof(int) * fc->partitions);
-    if (!fc->partition_to_class)
-        return AVERROR(ENOMEM);
-    fc->nclasses           = 0;
-    for (i = 0; i < fc->partitions; i++) {
-        static const int a[] = {0, 1, 2, 2, 3, 3, 4, 4};
-        fc->partition_to_class[i] = a[i];
-        fc->nclasses = FFMAX(fc->nclasses, fc->partition_to_class[i]);
-    }
-    fc->nclasses++;
-    fc->classes = av_malloc_array(fc->nclasses, sizeof(vorbis_enc_floor_class));
-    if (!fc->classes)
-        return AVERROR(ENOMEM);
-    for (i = 0; i < fc->nclasses; i++) {
-        vorbis_enc_floor_class * c = &fc->classes[i];
-        int j, books;
-        c->dim        = floor_classes[i].dim;
-        c->subclass   = floor_classes[i].subclass;
-        c->masterbook = floor_classes[i].masterbook;
-        books         = (1 << c->subclass);
-        c->books      = av_malloc_array(books, sizeof(int));
-        if (!c->books)
-            return AVERROR(ENOMEM);
-        for (j = 0; j < books; j++)
-            c->books[j] = floor_classes[i].nbooks[j];
-    }
-    fc->multiplier = 2;
-    fc->rangebits  = venc->log2_blocksize[1] - 1;
-
-    fc->values = 2;
-    for (i = 0; i < fc->partitions; i++)
-        fc->values += fc->classes[fc->partition_to_class[i]].dim;
-
-    fc->list = av_malloc_array(fc->values, sizeof(vorbis_floor1_entry));
-    if (!fc->list)
-        return AVERROR(ENOMEM);
-    fc->list[0].x = 0;
-    fc->list[1].x = 1 << fc->rangebits;
-    for (i = 2; i < fc->values; i++) {
-        static const int a[] = {
-             93, 23,372,  6, 46,186,750, 14, 33, 65,
-            130,260,556,  3, 10, 18, 28, 39, 55, 79,
-            111,158,220,312,464,650,850
-        };
-        fc->list[i].x = a[i - 2];
-    }
-    if (ff_vorbis_ready_floor1_list(avctx, fc->list, fc->values))
-        return AVERROR_BUG;
-
-    venc->nresidues = 1;
-    venc->residues  = av_malloc(sizeof(vorbis_enc_residue) * venc->nresidues);
-    if (!venc->residues)
-        return AVERROR(ENOMEM);
-
-    // single residue
-    rc = &venc->residues[0];
-    rc->type            = 2;
-    rc->begin           = 0;
-    rc->end             = 1600;
-    rc->partition_size  = 32;
-    rc->classifications = 10;
-    rc->classbook       = 15;
-    rc->books           = av_malloc(sizeof(*rc->books) * rc->classifications);
-    if (!rc->books)
-        return AVERROR(ENOMEM);
-    {
-        static const int8_t a[10][8] = {
-            { -1, -1, -1, -1, -1, -1, -1, -1, },
-            { -1, -1, 16, -1, -1, -1, -1, -1, },
-            { -1, -1, 17, -1, -1, -1, -1, -1, },
-            { -1, -1, 18, -1, -1, -1, -1, -1, },
-            { -1, -1, 19, -1, -1, -1, -1, -1, },
-            { -1, -1, 20, -1, -1, -1, -1, -1, },
-            { -1, -1, 21, -1, -1, -1, -1, -1, },
-            { 22, 23, -1, -1, -1, -1, -1, -1, },
-            { 24, 25, -1, -1, -1, -1, -1, -1, },
-            { 26, 27, 28, -1, -1, -1, -1, -1, },
-        };
-        memcpy(rc->books, a, sizeof a);
-    }
-    if ((ret = ready_residue(rc, venc)) < 0)
+    if ((ret = create_floors(venc, avctx)) < 0)
         return ret;
 
-    venc->nmappings = 1;
+    if ((ret = create_residues(venc)) < 0)
+        return ret;
+
+    venc->nmappings = 2;
     venc->mappings  = av_malloc(sizeof(vorbis_enc_mapping) * venc->nmappings);
     if (!venc->mappings)
         return AVERROR(ENOMEM);
 
-    // single mapping
-    mc = &venc->mappings[0];
-    mc->submaps = 1;
-    mc->mux     = av_malloc(sizeof(int) * venc->channels);
-    if (!mc->mux)
-        return AVERROR(ENOMEM);
-    for (i = 0; i < venc->channels; i++)
-        mc->mux[i] = 0;
-    mc->floor   = av_malloc(sizeof(int) * mc->submaps);
-    mc->residue = av_malloc(sizeof(int) * mc->submaps);
-    if (!mc->floor || !mc->residue)
-        return AVERROR(ENOMEM);
-    for (i = 0; i < mc->submaps; i++) {
-        mc->floor[i]   = 0;
-        mc->residue[i] = 0;
-    }
-    mc->coupling_steps = venc->channels == 2 ? 1 : 0;
-    mc->magnitude      = av_malloc(sizeof(int) * mc->coupling_steps);
-    mc->angle          = av_malloc(sizeof(int) * mc->coupling_steps);
-    if (!mc->magnitude || !mc->angle)
-        return AVERROR(ENOMEM);
-    if (mc->coupling_steps) {
-        mc->magnitude[0] = 0;
-        mc->angle[0]     = 1;
+    for (map = 0; map < venc->nmappings; map++) {
+        mc = &venc->mappings[map];
+        mc->submaps = 1;
+        mc->mux     = av_malloc(sizeof(int) * venc->channels);
+        if (!mc->mux)
+            return AVERROR(ENOMEM);
+        for (i = 0; i < venc->channels; i++)
+            mc->mux[i] = 0;
+        mc->floor   = av_malloc(sizeof(int) * mc->submaps);
+        mc->residue = av_malloc(sizeof(int) * mc->submaps);
+        if (!mc->floor || !mc->residue)
+            return AVERROR(ENOMEM);
+        for (i = 0; i < mc->submaps; i++) {
+            mc->floor[i]   = map;
+            mc->residue[i] = map;
+        }
+        mc->coupling_steps = venc->channels == 2 ? 1 : 0;
+        mc->magnitude      = av_malloc(sizeof(int) * mc->coupling_steps);
+        mc->angle          = av_malloc(sizeof(int) * mc->coupling_steps);
+        if (!mc->magnitude || !mc->angle)
+            return AVERROR(ENOMEM);
+        if (mc->coupling_steps) {
+            mc->magnitude[0] = 0;
+            mc->angle[0]     = 1;
+        }
     }
 
     venc->nmodes = 2;
@@ -452,7 +478,7 @@ static int create_vorbis_context(vorbis_enc_context *venc,
     venc->modes[0].mapping   = 0;
     // Long block
     venc->modes[1].blockflag = 1;
-    venc->modes[1].mapping   = 0;
+    venc->modes[1].mapping   = 1;
 
     venc->have_saved = 0;
     venc->saved      = av_malloc_array(sizeof(float) * venc->channels, (1 << venc->log2_blocksize[1]) / 2);
@@ -500,7 +526,7 @@ static void put_codebook_header(PutBitContext *pb, vorbis_enc_codebook *cb)
     put_bits(pb, 24, cb->nentries);
 
     for (i = 1; i < cb->nentries; i++)
-        if (cb->lens[i] < cb->lens[i-1])
+        if (cb->lens[i-1] == 0 || cb->lens[i] < cb->lens[i-1])
             break;
     if (i == cb->nentries)
         ordered = 1;
@@ -944,10 +970,11 @@ static int residue_encode(vorbis_enc_context *venc, vorbis_enc_residue *rc,
             if (pass == 0)
                 for (j = 0; j < channels; j++) {
                     vorbis_enc_codebook * book = &venc->codebooks[rc->classbook];
-                    int entry = 0;
-                    for (i = 0; i < classwords; i++) {
+                    int entry = classes[j][p];
+                    for (i = 1; i < classwords; i++) {
                         entry *= rc->classifications;
-                        entry += classes[j][p + i];
+                        if (p + i < partitions)
+                            entry += classes[j][p + i];
                     }
                     if (put_codeword(pb, book, entry))
                         return AVERROR(EINVAL);
@@ -1006,27 +1033,82 @@ static int residue_encode(vorbis_enc_context *venc, vorbis_enc_residue *rc,
     return 0;
 }
 
-static int apply_window_and_mdct(vorbis_enc_context *venc)
+/**
+ * Overlap windowed samples based on the suggested sequence from psy model.
+ * See Vorbis I spec Fig. 2, 3 for examples.
+ */
+static void apply_window(vorbis_enc_context *venc, const int *blockflags,
+                         float *out, float* in)
 {
-    int channel;
-    const float * win = venc->win[1];
-    int window_len = 1 << (venc->log2_blocksize[1] - 1);
-    float n = (float)(1 << venc->log2_blocksize[1]) / 4.0;
+    int prev_size, curr_size, next_size, bound;
+    float scale = 1.0f / (float) (1 << venc->log2_blocksize[blockflags[1]] - 2);
+    const float *prev_win, *next_win;
     AVFloatDSPContext *fdsp = venc->fdsp;
 
+    prev_size = 1 << (venc->log2_blocksize[blockflags[0]] - 1);
+    curr_size = 1 << (venc->log2_blocksize[blockflags[1]] - 1);
+    next_size = 1 << (venc->log2_blocksize[blockflags[2]] - 1);
+
+    prev_win = venc->win[blockflags[0]];
+    next_win = venc->win[blockflags[2]];
+
+    bound = curr_size / 2 - prev_size / 2;
+    memset(out, 0, sizeof(float) * bound);
+
+    fdsp->vector_fmul(out + bound, in + bound, prev_win, prev_size);
+    bound += prev_size;
+
+    memcpy(out + bound, in + bound, sizeof(float) * (curr_size - bound));
+    bound = curr_size + curr_size / 2 - next_size / 2;
+
+    memcpy(out + curr_size, in + curr_size, sizeof(float) * (bound - curr_size));
+
+    memcpy(out + bound, in + bound, sizeof(float) * (curr_size / 2 - next_size / 2));
+    bound += curr_size / 2 - next_size / 2;
+
+    fdsp->vector_fmul_reverse(out + bound, in + bound, next_win, next_size);
+    bound += next_size;
+
+    memset(out + bound, 0, sizeof(float) * (2 * curr_size - bound));
+    fdsp->vector_fmul_scalar(out, out, scale, 2 * curr_size);
+}
+
+static int apply_window_and_mdct(vorbis_enc_context *venc, int next_type)
+{
+    int channel, transient_offset, curr_len, curr_type;
+    int *blockflags = venc->blockflags;
+    int short_len = 1 << (venc->log2_blocksize[0] - 1);
+    int long_len = 1 << (venc->log2_blocksize[1] - 1);
+
+    if (venc->transient < 0) {
+        curr_type = venc->blockflags[2];
+        transient_offset = 0;
+    } else {
+        curr_type = 0;
+        transient_offset = venc->transient * short_len;
+    }
+
+    if (!curr_type)
+        venc->transient++;
+
+    blockflags[0] = curr_type ? blockflags[1] : 0;
+    blockflags[1] = curr_type;
+    blockflags[2] = curr_type ? next_type : 0;
+
+    curr_len = curr_type ? long_len : short_len;
     for (channel = 0; channel < venc->channels; channel++) {
-        float *offset = venc->samples + channel * window_len * 2;
+        float *out = venc->scratch;
+        float *in  = venc->samples + channel * 2 * long_len + transient_offset;
 
-        fdsp->vector_fmul(offset, offset, win, window_len);
-        fdsp->vector_fmul_scalar(offset, offset, 1/n, window_len);
+        apply_window(venc, blockflags, out, in);
 
-        offset += window_len;
+        venc->mdct[curr_type].mdct_calc(&venc->mdct[curr_type],
+                                        venc->coeffs + channel * curr_len, out);
+    }
 
-        fdsp->vector_fmul_reverse(offset, offset, win, window_len);
-        fdsp->vector_fmul_scalar(offset, offset, 1/n, window_len);
-
-        venc->mdct[1].mdct_calc(&venc->mdct[1], venc->coeffs + channel * window_len,
-                     venc->samples + channel * window_len * 2);
+    if (venc->transient < 0 || venc->transient >= venc->num_transient - 1) {
+        blockflags[2] = next_type;
+        venc->transient = -1;
     }
     return 1;
 }
@@ -1093,10 +1175,9 @@ static int vorbis_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
                                const AVFrame *frame, int *got_packet_ptr)
 {
     vorbis_enc_context *venc = avctx->priv_data;
-    int i, ret, need_more, ch;
-    int curr_win = 1;
-    int frame_size = 1 << (venc->log2_blocksize[1] - 1);
-    int block_size = 1 << (venc->log2_blocksize[0] - 1);
+    int i, ret, need_more, ch, curr_len, next_win = 1;
+    int long_win = 1 << (venc->log2_blocksize[1] - 1);
+    int short_win = 1 << (venc->log2_blocksize[0] - 1);
     vorbis_enc_mode *mode;
     vorbis_enc_mapping *mapping;
     PutBitContext pb;
@@ -1109,15 +1190,15 @@ static int vorbis_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
         if (!venc->afq.remaining_samples)
             return 0;
 
-    need_more = venc->bufqueue.available * avctx->frame_size < frame_size;
+    need_more = venc->bufqueue.available * avctx->frame_size < long_win;
     need_more = frame && need_more;
     if (need_more)
         return 0;
 
     /* Pad the bufqueue with empty frames for encoding the last packet. */
     if (!frame) {
-        if (venc->bufqueue.available * avctx->frame_size < frame_size) {
-            int frames_needed = (frame_size/avctx->frame_size) - venc->bufqueue.available;
+        if (venc->bufqueue.available * avctx->frame_size < long_win) {
+            int frames_needed = (long_win / avctx->frame_size) - venc->bufqueue.available;
 
             for (int i = 0; i < frames_needed; i++) {
                AVFrame *empty = spawn_empty_frame(avctx, venc->channels);
@@ -1129,16 +1210,18 @@ static int vorbis_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
         }
     }
 
-    move_audio(venc, avctx->frame_size);
+    if (venc->transient < 0) {
+        move_audio(venc, avctx->frame_size);
 
-    for (ch = 0; ch < venc->channels; ch++) {
-        float *scratch = venc->scratch + 2 * ch * frame_size + frame_size;
+        for (ch = 0; ch < venc->channels; ch++) {
+            float *scratch = venc->scratch + 2 * ch * long_win + long_win;
 
-        if (!ff_psy_vorbis_block_frame(venc->vpctx, scratch, ch, frame_size, block_size))
-            curr_win = 0;
+            if (!ff_psy_vorbis_block_frame(venc->vpctx, scratch, ch, long_win, short_win))
+                next_win = 0;
+        }
     }
 
-    if (!apply_window_and_mdct(venc))
+    if (!apply_window_and_mdct(venc, next_win))
         return 0;
 
     if ((ret = ff_alloc_packet2(avctx, avpkt, 8192, 0)) < 0)
@@ -1153,33 +1236,34 @@ static int vorbis_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
 
     put_bits(&pb, 1, 0); // magic bit
 
-    put_bits(&pb, ilog(venc->nmodes - 1), 1); // Mode for current frame
-
-    mode    = &venc->modes[1];
+    put_bits(&pb, ilog(venc->nmodes - 1), venc->blockflags[1]); // Mode for current frame
+    mode    = &venc->modes[venc->blockflags[1]];
     mapping = &venc->mappings[mode->mapping];
     if (mode->blockflag) {
-        put_bits(&pb, 1, 1); // Previous windowflag
-        put_bits(&pb, 1, 1); // Next windowflag
+        put_bits(&pb, 1, venc->blockflags[0]); // Previous windowflag
+        put_bits(&pb, 1, venc->blockflags[2]); // Next windowflag
     }
 
-    for (i = 0; i < venc->channels; i++) {
-        vorbis_enc_floor *fc = &venc->floors[mapping->floor[mapping->mux[i]]];
+    curr_len = venc->blockflags[1] ? long_win : short_win;
+    for (ch = 0; ch < venc->channels; ch++) {
+        vorbis_enc_floor *fc = &venc->floors[mapping->floor[mapping->mux[ch]]];
         uint16_t posts[MAX_FLOOR_VALUES];
-        floor_fit(venc, fc, &venc->coeffs[i * frame_size], posts, frame_size);
-        if (floor_encode(venc, fc, &pb, posts, &venc->floor[i * frame_size], frame_size)) {
+
+        floor_fit(venc, fc, &venc->coeffs[ch * curr_len], posts, curr_len);
+        if (floor_encode(venc, fc, &pb, posts, &venc->floor[ch * curr_len], curr_len)) {
             av_log(avctx, AV_LOG_ERROR, "output buffer is too small\n");
             return AVERROR(EINVAL);
         }
     }
 
-    for (i = 0; i < venc->channels * frame_size; i++)
+    for (i = 0; i < venc->channels * curr_len; i++)
         venc->coeffs[i] /= venc->floor[i];
 
     for (i = 0; i < mapping->coupling_steps; i++) {
-        float *mag = venc->coeffs + mapping->magnitude[i] * frame_size;
-        float *ang = venc->coeffs + mapping->angle[i]     * frame_size;
+        float *mag = venc->coeffs + mapping->magnitude[i] * curr_len;
+        float *ang = venc->coeffs + mapping->angle[i]     * curr_len;
         int j;
-        for (j = 0; j < frame_size; j++) {
+        for (j = 0; j < curr_len; j++) {
             float a = ang[j];
             ang[j] -= mag[j];
             if (mag[j] > 0)
@@ -1190,7 +1274,7 @@ static int vorbis_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     }
 
     if (residue_encode(venc, &venc->residues[mapping->residue[mapping->mux[0]]],
-                       &pb, venc->coeffs, frame_size, venc->channels)) {
+                       &pb, venc->coeffs, curr_len, venc->channels)) {
         av_log(avctx, AV_LOG_ERROR, "output buffer is too small\n");
         return AVERROR(EINVAL);
     }
@@ -1198,13 +1282,13 @@ static int vorbis_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     flush_put_bits(&pb);
     avpkt->size = put_bits_count(&pb) >> 3;
 
-    ff_af_queue_remove(&venc->afq, frame_size, &avpkt->pts, &avpkt->duration);
+    ff_af_queue_remove(&venc->afq, curr_len, &avpkt->pts, &avpkt->duration);
 
-    if (frame_size > avpkt->duration) {
+    if (long_win > avpkt->duration) {
         uint8_t *side = av_packet_new_side_data(avpkt, AV_PKT_DATA_SKIP_SAMPLES, 10);
         if (!side)
             return AVERROR(ENOMEM);
-        AV_WL32(&side[4], frame_size - avpkt->duration);
+        AV_WL32(&side[4], curr_len - avpkt->duration);
     }
 
     *got_packet_ptr = 1;
