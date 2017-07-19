@@ -111,7 +111,7 @@ static int ready_residue(vorbis_enc_residue *rc, vorbis_enc_context *venc)
                 break;
         if (j == 8) // zero
             continue;
-        cb = &venc->codebooks[rc->books[i][j]];
+        cb = &venc->res_books[rc->books[i][j]];
         assert(cb->ndimensions >= 2);
         assert(cb->lookup);
 
@@ -171,7 +171,7 @@ static int create_residues(vorbis_enc_context *venc)
         rc->begin           = 0;
         rc->end             = res ? 1600 : 208;
         rc->partition_size  = res ?   32 :  16;
-        rc->classbook       = res ?   24 :  23;
+        rc->classbook       = res ?    1 :   0;
         rc->classifications = 10;
         rc->books           = av_malloc(sizeof(*rc->books) * rc->classifications);
         if (!rc->books)
@@ -179,15 +179,15 @@ static int create_residues(vorbis_enc_context *venc)
         {
             static const int8_t a[10][8] = {
                 { -1, -1, -1, -1, -1, -1, -1, -1, },
-                { -1, -1, 25, -1, -1, -1, -1, -1, },
-                { -1, -1, 26, -1, -1, -1, -1, -1, },
-                { -1, -1, 27, -1, -1, -1, -1, -1, },
-                { -1, -1, 28, -1, -1, -1, -1, -1, },
-                { -1, -1, 29, -1, -1, -1, -1, -1, },
-                { -1, -1, 30, -1, -1, -1, -1, -1, },
-                { 31, 32, -1, -1, -1, -1, -1, -1, },
-                { 33, 34, -1, -1, -1, -1, -1, -1, },
-                { 35, 36, 37, -1, -1, -1, -1, -1, },
+                { -1, -1,  2, -1, -1, -1, -1, -1, },
+                { -1, -1,  3, -1, -1, -1, -1, -1, },
+                { -1, -1,  4, -1, -1, -1, -1, -1, },
+                { -1, -1,  5, -1, -1, -1, -1, -1, },
+                { -1, -1,  6, -1, -1, -1, -1, -1, },
+                { -1, -1,  7, -1, -1, -1, -1, -1, },
+                {  8,  9, -1, -1, -1, -1, -1, -1, },
+                { 10, 11, -1, -1, -1, -1, -1, -1, },
+                { 12, 13, 14, -1, -1, -1, -1, -1, },
             };
             memcpy(rc->books, a, sizeof a);
         }
@@ -264,11 +264,53 @@ static int create_floors(vorbis_enc_context *venc, AVCodecContext *avctx)
     return 0;
 }
 
+/**
+ * Copy the codebooks from the hardcoded configurations into the vorbis context
+ */
+static int copy_codebooks(vorbis_enc_codebook *dest,
+                          const codebook_setup *source,
+                          const int num_books)
+{
+    int book;
+    for (book = 0; book < num_books; book++) {
+        int ret;
+        vorbis_enc_codebook *cb = &dest[book];
+        cb->ndimensions = source[book].dim;
+        cb->nentries    = source[book].real_len;
+        cb->min         = source[book].min;
+        cb->delta       = source[book].delta;
+        cb->lookup      = source[book].lookup;
+        cb->seq_p       = 0;
+
+        cb->lens      = av_malloc_array(cb->nentries, sizeof(uint8_t));
+        cb->codewords = av_malloc_array(cb->nentries, sizeof(uint32_t));
+        if (!cb->lens || !cb->codewords)
+            return AVERROR(ENOMEM);
+        memcpy(cb->lens, source[book].clens, source[book].len);
+        memset(cb->lens + source[book].len, 0, cb->nentries - source[book].len);
+
+        if (cb->lookup) {
+            int i, vals = cb_lookup_vals(cb->lookup, cb->ndimensions, cb->nentries);
+            cb->quantlist = av_malloc_array(vals, sizeof(int));
+            if (!cb->quantlist)
+                return AVERROR(ENOMEM);
+            for (i = 0; i < vals; i++)
+                cb->quantlist[i] = source[book].quant[i];
+        } else {
+            cb->quantlist = NULL;
+        }
+        if ((ret = ready_codebook(cb)) < 0)
+            return ret;
+    }
+
+    return 0;
+}
+
 static int create_vorbis_context(vorbis_enc_context *venc,
                                  AVCodecContext *avctx)
 {
     vorbis_enc_mapping *mc;
-    int i, map, book, ret, blocks;
+    int i, map, ret, blocks;
 
     venc->channels    = avctx->channels;
     venc->sample_rate = avctx->sample_rate;
@@ -278,45 +320,23 @@ static int create_vorbis_context(vorbis_enc_context *venc,
     venc->transient = -1;
     venc->num_transient = 1 << (venc->log2_blocksize[1] - venc->log2_blocksize[0]);
 
-    venc->ncodebooks = FF_ARRAY_ELEMS(cvectors);
-    venc->codebooks  = av_malloc(sizeof(vorbis_enc_codebook) * venc->ncodebooks);
-    if (!venc->codebooks)
+    // Setup and configure our floors
+    venc->nfloor_books = FF_ARRAY_ELEMS(floor_config);
+    venc->floor_books = av_malloc(sizeof(vorbis_enc_codebook) * venc->nfloor_books);
+    if (!venc->floor_books)
         return AVERROR(ENOMEM);
 
-    for (book = 0; book < venc->ncodebooks; book++) {
-        vorbis_enc_codebook *cb = &venc->codebooks[book];
-        int vals;
-        cb->ndimensions = cvectors[book].dim;
-        cb->nentries    = cvectors[book].real_len;
-        cb->min         = cvectors[book].min;
-        cb->delta       = cvectors[book].delta;
-        cb->lookup      = cvectors[book].lookup;
-        cb->seq_p       = 0;
-
-        cb->lens      = av_malloc_array(cb->nentries, sizeof(uint8_t));
-        cb->codewords = av_malloc_array(cb->nentries, sizeof(uint32_t));
-        if (!cb->lens || !cb->codewords)
-            return AVERROR(ENOMEM);
-        memcpy(cb->lens, cvectors[book].clens, cvectors[book].len);
-        memset(cb->lens + cvectors[book].len, 0, cb->nentries - cvectors[book].len);
-
-        if (cb->lookup) {
-            vals = cb_lookup_vals(cb->lookup, cb->ndimensions, cb->nentries);
-            cb->quantlist = av_malloc_array(vals, sizeof(int));
-            if (!cb->quantlist)
-                return AVERROR(ENOMEM);
-            for (i = 0; i < vals; i++)
-                cb->quantlist[i] = cvectors[book].quant[i];
-        } else {
-            cb->quantlist = NULL;
-        }
-        if ((ret = ready_codebook(cb)) < 0)
-            return ret;
-    }
-
+    copy_codebooks(venc->floor_books, floor_config, venc->nfloor_books);
     if ((ret = create_floors(venc, avctx)) < 0)
         return ret;
 
+    // Setup and configure our residues
+    venc->nres_books = FF_ARRAY_ELEMS(res_config);
+    venc->res_books = av_malloc(sizeof(vorbis_enc_codebook) * venc->nres_books);
+    if (!venc->res_books)
+        return AVERROR(ENOMEM);
+
+    copy_codebooks(venc->res_books, res_config, venc->nres_books);
     if ((ret = create_residues(venc)) < 0)
         return ret;
 
@@ -498,7 +518,8 @@ static void put_floor_header(PutBitContext *pb, vorbis_enc_floor *fc)
         put_bits(pb, fc->rangebits, fc->list[i].x);
 }
 
-static void put_residue_header(PutBitContext *pb, vorbis_enc_residue *rc)
+static void put_residue_header(PutBitContext *pb, vorbis_enc_residue *rc,
+                               const int book_offset)
 {
     int i;
 
@@ -508,7 +529,7 @@ static void put_residue_header(PutBitContext *pb, vorbis_enc_residue *rc)
     put_bits(pb, 24, rc->end);
     put_bits(pb, 24, rc->partition_size - 1);
     put_bits(pb, 6, rc->classifications - 1);
-    put_bits(pb, 8, rc->classbook);
+    put_bits(pb, 8, book_offset + rc->classbook);
 
     for (i = 0; i < rc->classifications; i++) {
         int j, tmp = 0;
@@ -526,7 +547,7 @@ static void put_residue_header(PutBitContext *pb, vorbis_enc_residue *rc)
         int j;
         for (j = 0; j < 8; j++)
             if (rc->books[i][j] != -1)
-                put_bits(pb, 8, rc->books[i][j]);
+                put_bits(pb, 8, book_offset + rc->books[i][j]);
     }
 }
 
@@ -581,9 +602,12 @@ static int put_main_header(vorbis_enc_context *venc, uint8_t **out)
         put_bits(&pb, 8, "vorbis"[i]);
 
     // codebooks
-    put_bits(&pb, 8, venc->ncodebooks - 1);
-    for (i = 0; i < venc->ncodebooks; i++)
-        put_codebook_header(&pb, &venc->codebooks[i]);
+    put_bits(&pb, 8, venc->nfloor_books + venc->nres_books - 1);
+    for (i = 0; i < venc->nfloor_books; i++)
+        put_codebook_header(&pb, &venc->floor_books[i]);
+
+    for (i = 0; i < venc->nres_books; i++)
+        put_codebook_header(&pb, &venc->res_books[i]);
 
     // time domain, reserved, zero
     put_bits(&pb,  6, 0);
@@ -597,7 +621,7 @@ static int put_main_header(vorbis_enc_context *venc, uint8_t **out)
     // residues
     put_bits(&pb, 6, venc->nresidues - 1);
     for (i = 0; i < venc->nresidues; i++)
-        put_residue_header(&pb, &venc->residues[i]);
+        put_residue_header(&pb, &venc->residues[i], venc->nfloor_books);
 
     // mappings
     put_bits(&pb, 6, venc->nmappings - 1);
@@ -760,14 +784,14 @@ static int floor_encode(vorbis_enc_context *venc, vorbis_enc_floor *fc,
         vorbis_enc_floor_class * c = &fc->classes[fc->partition_to_class[i]];
         int k, cval = 0, csub = 1<<c->subclass;
         if (c->subclass) {
-            vorbis_enc_codebook * book = &venc->codebooks[c->masterbook];
+            vorbis_enc_codebook * book = &venc->floor_books[c->masterbook];
             int cshift = 0;
             for (k = 0; k < c->dim; k++) {
                 int l;
                 for (l = 0; l < csub; l++) {
                     int maxval = 1;
                     if (c->books[l] != -1)
-                        maxval = venc->codebooks[c->books[l]].nentries;
+                        maxval = venc->floor_books[c->books[l]].nentries;
                     // coded could be -1, but this still works, cause that is 0
                     if (coded[counter + k] < maxval)
                         break;
@@ -787,7 +811,7 @@ static int floor_encode(vorbis_enc_context *venc, vorbis_enc_floor *fc,
                 continue;
             if (entry == -1)
                 entry = 0;
-            if (put_codeword(pb, &venc->codebooks[book], entry))
+            if (put_codeword(pb, &venc->floor_books[book], entry))
                 return AVERROR(EINVAL);
         }
     }
@@ -830,10 +854,10 @@ static int residue_encode(vorbis_enc_context *venc, vorbis_enc_residue *rc,
     int partitions = (rc->end - rc->begin) / psize;
     int channels   = (rc->type == 2) ? 1 : real_ch;
     int classes[MAX_CHANNELS][NUM_RESIDUE_PARTITIONS];
-    int classwords = venc->codebooks[rc->classbook].ndimensions;
+    int classwords = venc->res_books[rc->classbook].ndimensions;
 
     av_assert0(rc->type == 2);
-    av_assert0(real_ch == 2);
+    //av_assert0(real_ch == 2);
     for (p = 0; p < partitions; p++) {
         float max1 = 0.0, max2 = 0.0;
         int s = rc->begin + p * psize;
@@ -853,7 +877,7 @@ static int residue_encode(vorbis_enc_context *venc, vorbis_enc_residue *rc,
         while (p < partitions) {
             if (pass == 0)
                 for (j = 0; j < channels; j++) {
-                    vorbis_enc_codebook * book = &venc->codebooks[rc->classbook];
+                    vorbis_enc_codebook * book = &venc->res_books[rc->classbook];
                     int entry = classes[j][p];
                     for (i = 1; i < classwords; i++) {
                         entry *= rc->classifications;
@@ -866,7 +890,7 @@ static int residue_encode(vorbis_enc_context *venc, vorbis_enc_residue *rc,
             for (i = 0; i < classwords && p < partitions; i++, p++) {
                 for (j = 0; j < channels; j++) {
                     int nbook = rc->books[classes[j][p]][pass];
-                    vorbis_enc_codebook * book = &venc->codebooks[nbook];
+                    vorbis_enc_codebook * book = &venc->res_books[nbook];
                     float *buf = coeffs + samples*j + rc->begin + p*psize;
                     if (nbook == -1)
                         continue;
@@ -1185,15 +1209,25 @@ static av_cold int vorbis_encode_close(AVCodecContext *avctx)
     vorbis_enc_context *venc = avctx->priv_data;
     int i;
 
-    if (venc->codebooks)
-        for (i = 0; i < venc->ncodebooks; i++) {
-            av_freep(&venc->codebooks[i].lens);
-            av_freep(&venc->codebooks[i].codewords);
-            av_freep(&venc->codebooks[i].quantlist);
-            av_freep(&venc->codebooks[i].dimensions);
-            av_freep(&venc->codebooks[i].pow2);
+    if (venc->floor_books)
+        for (i = 0; i < venc->nfloor_books; i++) {
+            av_freep(&venc->floor_books[i].lens);
+            av_freep(&venc->floor_books[i].codewords);
+            av_freep(&venc->floor_books[i].quantlist);
+            av_freep(&venc->floor_books[i].dimensions);
+            av_freep(&venc->floor_books[i].pow2);
         }
-    av_freep(&venc->codebooks);
+    av_freep(&venc->floor_books);
+
+    if (venc->res_books)
+        for (i = 0; i < venc->nres_books; i++) {
+            av_freep(&venc->res_books[i].lens);
+            av_freep(&venc->res_books[i].codewords);
+            av_freep(&venc->res_books[i].quantlist);
+            av_freep(&venc->res_books[i].dimensions);
+            av_freep(&venc->res_books[i].pow2);
+        }
+    av_freep(&venc->res_books);
 
     if (venc->floors)
         for (i = 0; i < venc->nfloors; i++) {

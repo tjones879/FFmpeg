@@ -118,11 +118,14 @@ typedef struct vorbis_enc_context {
     AudioFrameQueue afq;
     struct FFBufQueue bufqueue;
 
-    int ncodebooks;
-    vorbis_enc_codebook *codebooks;
+    int nfloor_books;
+    vorbis_enc_codebook *floor_books;
 
     int nfloors;
     vorbis_enc_floor *floors;
+
+    int nres_books;
+    vorbis_enc_codebook *res_books;
 
     int nresidues;
     vorbis_enc_residue *residues;

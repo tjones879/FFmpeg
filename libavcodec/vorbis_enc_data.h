@@ -23,6 +23,17 @@
 
 #include <stdint.h>
 
+typedef const struct {
+    int dim;
+    int len;
+    int real_len;
+    const uint8_t *clens;
+    int lookup;
+    float min;
+    float delta;
+    const uint8_t *quant;
+} codebook_setup;
+
 static const uint8_t floor_128_c0[] = {
     10,  7,  8, 13,  9,  6,  7, 11, 10,  8,  8, 12, 17, 17, 17,
     17,  7,  5,  5,  9,  6,  4,  4,  8,  8,  5,  5,  8, 16, 14,
@@ -532,16 +543,7 @@ static const uint8_t res_p9_2[] = {
      9, 10, 10, 10,
 };
 
-static const struct {
-    int dim;
-    int len;
-    int real_len;
-    const uint8_t *clens;
-    int lookup;
-    float min;
-    float delta;
-    const uint8_t *quant;
-} cvectors[] = {
+codebook_setup floor_config[] = {
     { 2,   64,   64, floor_128_c0,     0 },
     { 2,  256,  256, floor_128_c1,     0 },
     { 2,   16,   16, floor_1024_c1,    0 },
@@ -565,6 +567,9 @@ static const struct {
     { 2,   18,   18, floor_1024_4sub1, 0 },
     { 2,   50,   50, floor_1024_4sub2, 0 },
     { 2,  128,  128, floor_1024_4sub3, 0 },
+};
+
+codebook_setup res_config[] = {
     { 2,  100,  100, res_short_master, 0 },
     { 2,  100,  100, res_long_master,  0 },
     { 8, 1641, 6561, res_p1_0, 1,    -1.0,   1.0, (const uint8_t[]){ 1, 0, 2, } },
