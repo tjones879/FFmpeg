@@ -155,7 +155,7 @@ static av_cold int dsp_init(AVCodecContext *avctx, vorbis_enc_context *venc)
     return 0;
 }
 
-static int create_residues(vorbis_enc_context *venc)
+static int create_residues(vorbis_enc_context *venc, res_setup setup)
 {
     int res, ret;
     vorbis_enc_residue *rc;
@@ -167,30 +167,17 @@ static int create_residues(vorbis_enc_context *venc)
 
     for (res = 0; res < venc->nresidues; res++) {
         rc = &venc->residues[res];
-        rc->type            = 2;
+        rc->type            = setup.type;
         rc->begin           = 0;
-        rc->end             = res ? 1600 : 208;
+        rc->end             = setup.end[res];
         rc->partition_size  = res ?   32 :  16;
         rc->classbook       = res ?    1 :   0;
-        rc->classifications = 10;
+        rc->classifications = setup.classifications;
         rc->books           = av_malloc(sizeof(*rc->books) * rc->classifications);
         if (!rc->books)
             return AVERROR(ENOMEM);
-        {
-            static const int8_t a[10][8] = {
-                { -1, -1, -1, -1, -1, -1, -1, -1, },
-                { -1, -1,  2, -1, -1, -1, -1, -1, },
-                { -1, -1,  3, -1, -1, -1, -1, -1, },
-                { -1, -1,  4, -1, -1, -1, -1, -1, },
-                { -1, -1,  5, -1, -1, -1, -1, -1, },
-                { -1, -1,  6, -1, -1, -1, -1, -1, },
-                { -1, -1,  7, -1, -1, -1, -1, -1, },
-                {  8,  9, -1, -1, -1, -1, -1, -1, },
-                { 10, 11, -1, -1, -1, -1, -1, -1, },
-                { 12, 13, 14, -1, -1, -1, -1, -1, },
-            };
-            memcpy(rc->books, a, sizeof a);
-        }
+
+        memcpy(rc->books, setup.books, sizeof(setup.books));
         if ((ret = ready_residue(rc, venc)) < 0)
             return ret;
     }
@@ -331,13 +318,13 @@ static int create_vorbis_context(vorbis_enc_context *venc,
         return ret;
 
     // Setup and configure our residues
-    venc->nres_books = FF_ARRAY_ELEMS(res_config);
+    venc->nres_books = res_class.nbooks;
     venc->res_books = av_malloc(sizeof(vorbis_enc_codebook) * venc->nres_books);
     if (!venc->res_books)
         return AVERROR(ENOMEM);
 
-    copy_codebooks(venc->res_books, res_config, venc->nres_books);
-    if ((ret = create_residues(venc)) < 0)
+    copy_codebooks(venc->res_books, res_class.config, venc->nres_books);
+    if ((ret = create_residues(venc, res_class)) < 0)
         return ret;
 
     venc->nmappings = 2;
