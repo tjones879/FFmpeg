@@ -167,7 +167,7 @@ static int create_residues(vorbis_enc_context *venc, res_setup setup)
 
     for (res = 0; res < venc->nresidues; res++) {
         rc = &venc->residues[res];
-        rc->type            = setup.type;
+        rc->type            = 2;
         rc->begin           = 0;
         rc->end             = setup.end[res];
         rc->partition_size  = res ?   32 :  16;
@@ -177,7 +177,8 @@ static int create_residues(vorbis_enc_context *venc, res_setup setup)
         if (!rc->books)
             return AVERROR(ENOMEM);
 
-        memcpy(rc->books, setup.books, sizeof(setup.books));
+        memcpy(rc->books, setup.books,
+               sizeof(**setup.books) * RES_PASSES * rc->classifications);
         if ((ret = ready_residue(rc, venc)) < 0)
             return ret;
     }
@@ -297,7 +298,7 @@ static int create_vorbis_context(vorbis_enc_context *venc,
                                  AVCodecContext *avctx)
 {
     vorbis_enc_mapping *mc;
-    int i, map, ret, blocks;
+    int i, map, ret, blocks, chan_config;
 
     venc->channels    = avctx->channels;
     venc->sample_rate = avctx->sample_rate;
@@ -318,13 +319,15 @@ static int create_vorbis_context(vorbis_enc_context *venc,
         return ret;
 
     // Setup and configure our residues
-    venc->nres_books = res_class.nbooks;
+    chan_config = venc->channels - 1;
+    chan_config = chan_config > 1 ? 2 : chan_config;
+    venc->nres_books = res_class[chan_config].nbooks;
     venc->res_books = av_malloc(sizeof(vorbis_enc_codebook) * venc->nres_books);
     if (!venc->res_books)
         return AVERROR(ENOMEM);
 
-    copy_codebooks(venc->res_books, res_class.config, venc->nres_books);
-    if ((ret = create_residues(venc, res_class)) < 0)
+    copy_codebooks(venc->res_books, res_class[chan_config].config, venc->nres_books);
+    if ((ret = create_residues(venc, res_class[chan_config])) < 0)
         return ret;
 
     venc->nmappings = 2;
@@ -836,7 +839,7 @@ static int residue_encode(vorbis_enc_context *venc, vorbis_enc_residue *rc,
                           PutBitContext *pb, float *coeffs, int samples,
                           int real_ch)
 {
-    int pass, i, j, p, k;
+    int pass, ch, i, j, p, k;
     int psize      = rc->partition_size;
     int partitions = (rc->end - rc->begin) / psize;
     int channels   = (rc->type == 2) ? 1 : real_ch;
@@ -844,22 +847,27 @@ static int residue_encode(vorbis_enc_context *venc, vorbis_enc_residue *rc,
     int classwords = venc->res_books[rc->classbook].ndimensions;
 
     av_assert0(rc->type == 2);
-    //av_assert0(real_ch == 2);
     for (p = 0; p < partitions; p++) {
-        float max1 = 0.0, max2 = 0.0;
+        float max[MAX_CHANNELS] = { 0, 0, };
         int s = rc->begin + p * psize;
-        for (k = s; k < s + psize; k += 2) {
-            max1 = FFMAX(max1, fabs(coeffs[          k / real_ch]));
-            max2 = FFMAX(max2, fabs(coeffs[samples + k / real_ch]));
-        }
+        for (k = s; k < s + psize; k += real_ch)
+            for (ch = 0; ch < real_ch; ch++)
+                max[ch] = FFMAX(max[ch], fabs(coeffs[samples * ch + k / real_ch]));
 
-        for (i = 0; i < rc->classifications - 1; i++)
-            if (max1 < rc->maxes[i][0] && max2 < rc->maxes[i][1])
+        /* Keep checking until all channels' values are less than their respective
+           residue maxes */
+        for (i = 0; i < rc->classifications - 1; i++) {
+            int found = 0;
+            for (ch = 0; ch < real_ch; ch++)
+                if (max[ch] < rc->maxes[i][ch])
+                    found++;
+            if (found == real_ch)
                 break;
+        }
         classes[0][p] = i;
     }
 
-    for (pass = 0; pass < 8; pass++) {
+    for (pass = 0; pass < RES_PASSES; pass++) {
         p = 0;
         while (p < partitions) {
             if (pass == 0)
@@ -1270,8 +1278,8 @@ static av_cold int vorbis_encode_init(AVCodecContext *avctx)
     vorbis_enc_context *venc = avctx->priv_data;
     int ret;
 
-    if (avctx->channels != 2) {
-        av_log(avctx, AV_LOG_ERROR, "Current FFmpeg Vorbis encoder only supports 2 channels.\n");
+    if (avctx->channels > 2) {
+        av_log(avctx, AV_LOG_ERROR, "Current FFmpeg Vorbis encoder only supports 1 or 2 channels.\n");
         return -1;
     }
 
