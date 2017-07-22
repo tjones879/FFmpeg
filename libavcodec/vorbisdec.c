@@ -971,7 +971,11 @@ static int vorbis_parse_id_hdr(vorbis_context *vc)
         return AVERROR_INVALIDDATA;
     }
 
-    vc->version        = get_bits_long(gb, 32);    //FIXME check 0
+    vc->version        = get_bits_long(gb, 32);
+    if (vc->version) {
+        av_log(vc->avctx, AV_LOG_ERROR, "Invalid vorbis version specified\n");
+        return AVERROR_INVALIDDATA;
+    }
     vc->audio_channels = get_bits(gb, 8);
     if (vc->audio_channels <= 0) {
         av_log(vc->avctx, AV_LOG_ERROR, "Invalid number of channels\n");
