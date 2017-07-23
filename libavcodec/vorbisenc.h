@@ -99,7 +99,8 @@ typedef struct vorbis_enc_mode {
 } vorbis_enc_mode;
 
 typedef struct vorbis_enc_context {
-    int channels;
+    int channels;      ///< Channel count not including any LFE that may be present
+    int lfe_chan;      ///< Designates if an LFE channel is present
     int sample_rate;
     int log2_blocksize[2];
     int blockflags[3]; ///< Flags used for the previous, current, next windows

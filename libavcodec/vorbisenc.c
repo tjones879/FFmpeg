@@ -294,11 +294,58 @@ static int copy_codebooks(vorbis_enc_codebook *dest,
     return 0;
 }
 
+/**
+ * Set the proper mappings given the current channel configuration.
+ *
+ * LFE channels require a separate submapping in order to be efficiently coded.
+ */
+static int create_mappings(vorbis_enc_context *venc)
+{
+    int i, map;
+    vorbis_enc_mapping *mc;
+
+    for (map = 0; map < venc->nmappings; map++) {
+        mc = &venc->mappings[map];
+        mc->submaps = venc->lfe_chan ? 2 : 1;
+        // TODO NOT SURE HOW THIS WORKS
+        mc->mux     = av_malloc(sizeof(int) * venc->channels);
+        if (!mc->mux)
+            return AVERROR(ENOMEM);
+        for (i = 0; i < venc->channels; i++)
+            mc->mux[i] = 0;
+        mc->floor   = av_malloc(sizeof(int) * mc->submaps);
+        mc->residue = av_malloc(sizeof(int) * mc->submaps);
+        if (!mc->floor || !mc->residue)
+            return AVERROR(ENOMEM);
+        for (i = 0; i < mc->submaps; i++) {
+            // TODO REFACTOR
+            mc->floor[i]   = i ? 2 : map;
+            mc->residue[i] = i ? 2 : map;
+        }
+        mc->coupling_steps = venc->channels == 2 ? 1 : 0; // TODO
+        // TODO NOT SURE HOW THESE WORK
+        mc->magnitude      = av_malloc(sizeof(int) * mc->coupling_steps);
+        mc->angle          = av_malloc(sizeof(int) * mc->coupling_steps);
+        if (!mc->magnitude || !mc->angle)
+            return AVERROR(ENOMEM);
+        if (mc->coupling_steps) {
+            mc->magnitude[0] = 0;
+            mc->angle[0]     = 1;
+        }
+    }
+}
+
+static void get_vorbis_channels()
+{
+    // Get res_class(es)
+    // Get floor_class(es)
+    // Abuse the knowledge of lfe existing to determine proper encoding
+}
+
 static int create_vorbis_context(vorbis_enc_context *venc,
                                  AVCodecContext *avctx)
 {
-    vorbis_enc_mapping *mc;
-    int i, map, ret, blocks, chan_config;
+    int ret, blocks, chan_config;
 
     venc->channels    = avctx->channels;
     venc->sample_rate = avctx->sample_rate;
@@ -307,6 +354,9 @@ static int create_vorbis_context(vorbis_enc_context *venc,
     venc->blockflags[0] = venc->blockflags[1] = venc->blockflags[2] = 1;
     venc->transient = -1;
     venc->num_transient = 1 << (venc->log2_blocksize[1] - venc->log2_blocksize[0]);
+
+    // Setup our channel configuration
+    // TODO SET have_lfe
 
     // Setup and configure our floors
     venc->nfloor_books = FF_ARRAY_ELEMS(floor_config);
@@ -319,6 +369,7 @@ static int create_vorbis_context(vorbis_enc_context *venc,
         return ret;
 
     // Setup and configure our residues
+    // TODO CHANGE THIS LOGIC
     chan_config = venc->channels - 1;
     chan_config = chan_config > 1 ? 2 : chan_config;
     venc->nres_books = res_class[chan_config].nbooks;
@@ -335,32 +386,6 @@ static int create_vorbis_context(vorbis_enc_context *venc,
     if (!venc->mappings)
         return AVERROR(ENOMEM);
 
-    for (map = 0; map < venc->nmappings; map++) {
-        mc = &venc->mappings[map];
-        mc->submaps = 1;
-        mc->mux     = av_malloc(sizeof(int) * venc->channels);
-        if (!mc->mux)
-            return AVERROR(ENOMEM);
-        for (i = 0; i < venc->channels; i++)
-            mc->mux[i] = 0;
-        mc->floor   = av_malloc(sizeof(int) * mc->submaps);
-        mc->residue = av_malloc(sizeof(int) * mc->submaps);
-        if (!mc->floor || !mc->residue)
-            return AVERROR(ENOMEM);
-        for (i = 0; i < mc->submaps; i++) {
-            mc->floor[i]   = map;
-            mc->residue[i] = map;
-        }
-        mc->coupling_steps = venc->channels == 2 ? 1 : 0;
-        mc->magnitude      = av_malloc(sizeof(int) * mc->coupling_steps);
-        mc->angle          = av_malloc(sizeof(int) * mc->coupling_steps);
-        if (!mc->magnitude || !mc->angle)
-            return AVERROR(ENOMEM);
-        if (mc->coupling_steps) {
-            mc->magnitude[0] = 0;
-            mc->angle[0]     = 1;
-        }
-    }
 
     venc->nmodes = 2;
     venc->modes  = av_malloc(sizeof(vorbis_enc_mode) * venc->nmodes);
