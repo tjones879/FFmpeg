@@ -898,8 +898,16 @@ static int vorbis_parse_setup_hdr_modes(vorbis_context *vc)
         vorbis_mode *mode_setup = &vc->modes[i];
 
         mode_setup->blockflag     = get_bits1(gb);
-        mode_setup->windowtype    = get_bits(gb, 16); //FIXME check
-        mode_setup->transformtype = get_bits(gb, 16); //FIXME check
+        mode_setup->windowtype    = get_bits(gb, 16);
+        if (mode_setup->windowtype) {
+            av_log(vc->avctx, AV_LOG_ERROR, "Invalid window type, must equal 0.\n");
+            return AVERROR_INVALIDDATA;
+        }
+        mode_setup->transformtype = get_bits(gb, 16);
+        if (mode_setup->transformtype) {
+            av_log(vc->avctx, AV_LOG_ERROR, "Invalid transform type, must equal 0.\n");
+            return AVERROR_INVALIDDATA;
+        }
         GET_VALIDATED_INDEX(mode_setup->mapping, 8, vc->mapping_count);
 
         ff_dlog(NULL, " %u mode: blockflag %d, windowtype %d, transformtype %d, mapping %d\n",
@@ -969,7 +977,11 @@ static int vorbis_parse_id_hdr(vorbis_context *vc)
         return AVERROR_INVALIDDATA;
     }
 
-    vc->version        = get_bits_long(gb, 32);    //FIXME check 0
+    vc->version        = get_bits_long(gb, 32);
+    if (vc->version) {
+        av_log(vc->avctx, AV_LOG_ERROR, "Invalid version number\n");
+        return AVERROR_INVALIDDATA;
+    }
     vc->audio_channels = get_bits(gb, 8);
     if (vc->audio_channels <= 0) {
         av_log(vc->avctx, AV_LOG_ERROR, "Invalid number of channels\n");
